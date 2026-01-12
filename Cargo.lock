@@ -130,6 +130,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cargomap"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "cargo_metadata",
+ "clap",
+ "indexmap",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rust-mcp-sdk",
+ "serde",
+ "serde_json",
+ "syn",
+ "thiserror",
+ "tokio",
+ "toml",
+ "walkdir",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -574,27 +595,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
-]
-
-[[package]]
-name = "rustin"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "cargo_metadata",
- "clap",
- "indexmap",
- "proc-macro2",
- "quote",
- "regex",
- "rust-mcp-sdk",
- "serde",
- "serde_json",
- "syn",
- "thiserror",
- "tokio",
- "toml",
- "walkdir",
 ]
 
 [[package]]
