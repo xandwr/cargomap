@@ -18,18 +18,18 @@ use std::sync::Arc;
 use crate::SemanticGravity;
 
 /// MCP Server handler for cargomap analysis tools
-pub struct cargomapServerHandler {
+pub struct CargomapServerHandler {
     project_root: PathBuf,
 }
 
-impl cargomapServerHandler {
+impl CargomapServerHandler {
     pub fn new(project_root: PathBuf) -> Self {
         Self { project_root }
     }
 }
 
 #[async_trait]
-impl ServerHandler for cargomapServerHandler {
+impl ServerHandler for CargomapServerHandler {
     async fn handle_list_tools_request(
         &self,
         _params: Option<PaginatedRequestParams>,
@@ -38,7 +38,7 @@ impl ServerHandler for cargomapServerHandler {
         Ok(ListToolsResult {
             meta: None,
             next_cursor: None,
-            tools: cargomapTools::tools(),
+            tools: CargomapTools::tools(),
         })
     }
 
@@ -47,15 +47,15 @@ impl ServerHandler for cargomapServerHandler {
         params: CallToolRequestParams,
         _runtime: Arc<dyn McpServer>,
     ) -> Result<CallToolResult, CallToolError> {
-        let tool_params: cargomapTools =
-            cargomapTools::try_from(params).map_err(CallToolError::new)?;
+        let tool_params: CargomapTools =
+            CargomapTools::try_from(params).map_err(CallToolError::new)?;
 
         match tool_params {
-            cargomapTools::AnalyzeStruct(tool) => tool.call_tool(&self.project_root),
-            cargomapTools::SearchCode(tool) => tool.call_tool(&self.project_root),
-            cargomapTools::GetSummary(tool) => tool.call_tool(&self.project_root),
-            cargomapTools::FindCallers(tool) => tool.call_tool(&self.project_root),
-            cargomapTools::GetExternalUsages(tool) => tool.call_tool(&self.project_root),
+            CargomapTools::AnalyzeStruct(tool) => tool.call_tool(&self.project_root),
+            CargomapTools::SearchCode(tool) => tool.call_tool(&self.project_root),
+            CargomapTools::GetSummary(tool) => tool.call_tool(&self.project_root),
+            CargomapTools::FindCallers(tool) => tool.call_tool(&self.project_root),
+            CargomapTools::GetExternalUsages(tool) => tool.call_tool(&self.project_root),
         }
     }
 }
@@ -477,7 +477,7 @@ impl GetExternalUsages {
 
 // Generate the tool_box enum
 tool_box!(
-    cargomapTools,
+    CargomapTools,
     [
         AnalyzeStruct,
         SearchCode,
@@ -515,7 +515,7 @@ pub async fn run_mcp_server(project_root: PathBuf) -> Result<(), Box<dyn std::er
     };
 
     let transport = StdioTransport::new(TransportOptions::default())?;
-    let handler = cargomapServerHandler::new(project_root);
+    let handler = CargomapServerHandler::new(project_root);
 
     let server: Arc<ServerRuntime> = server_runtime::create_server(McpServerOptions {
         server_details,
