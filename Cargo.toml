@@ -3,6 +3,10 @@ name = "rustin"
 version = "0.0.1"
 edition = "2024"
 publish = true
+license = "MIT"
+description = "A simple context fetcher for Rust projects"
+repository = "https://github.com/xandwr/rustin"
+homepage = "https://github.com/xandwr/rustin"
 
 [dependencies]
 cargo_metadata = "0.23.1"
