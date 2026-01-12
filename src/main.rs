@@ -188,11 +188,38 @@ fn cmd_search(gravity: &SemanticGravity, query: &str, limit: usize) {
             test_marker,
             result.score
         );
+
+        // Breadcrumbs (module path)
+        println!("   Path: {}", result.context.breadcrumbs);
+
         println!(
             "   File: {}:{}",
             result.item.file_path.display(),
             result.item.span.start_line
         );
+
+        // Parent context if available
+        if let Some(parent) = &result.context.parent_context {
+            println!("   In: {}", parent);
+        }
+
+        // Generic bounds (the "Live Signature")
+        if !result.context.generic_bounds.is_empty() {
+            let bounds_str: Vec<String> = result
+                .context
+                .generic_bounds
+                .iter()
+                .map(|gb| {
+                    if gb.bounds.is_empty() {
+                        gb.param.clone()
+                    } else {
+                        format!("{}: {}", gb.param, gb.bounds.join(" + "))
+                    }
+                })
+                .collect();
+            println!("   Generics: <{}>", bounds_str.join(", "));
+        }
+
         println!(
             "   Factors: x-mod={}, generics={}, calls={}, site={}",
             result.factors.cross_module_count,
@@ -207,6 +234,26 @@ fn cmd_search(gravity: &SemanticGravity, query: &str, limit: usize) {
                 result.factors.impl_count, result.factors.trait_impls
             );
         }
+
+        // Siblings with shared generics
+        let siblings_with_shared: Vec<_> = result
+            .context
+            .siblings
+            .iter()
+            .filter(|s| !s.shared_generics.is_empty())
+            .collect();
+        if !siblings_with_shared.is_empty() {
+            println!("   Related (shared generics):");
+            for sib in siblings_with_shared.iter().take(3) {
+                println!(
+                    "     - {} {} (shares: {})",
+                    sib.kind,
+                    sib.name,
+                    sib.shared_generics.join(", ")
+                );
+            }
+        }
+
         println!();
     }
 

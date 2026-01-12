@@ -299,11 +299,18 @@ impl PartialParser {
     /// Derive module path from file path
     fn derive_module_path(&self, path: &Path) -> Vec<String> {
         let mut parts = Vec::new();
+        let mut found_src = false;
 
         for component in path.components() {
             if let std::path::Component::Normal(os_str) = component {
                 if let Some(s) = os_str.to_str() {
-                    if s != "src" && s != "lib.rs" && s != "main.rs" && s != "mod.rs" {
+                    // Start collecting after "src" directory
+                    if s == "src" {
+                        found_src = true;
+                        continue;
+                    }
+
+                    if found_src && s != "lib.rs" && s != "main.rs" && s != "mod.rs" {
                         let name = s.strip_suffix(".rs").unwrap_or(s);
                         parts.push(name.to_string());
                     }

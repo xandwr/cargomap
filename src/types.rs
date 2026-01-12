@@ -152,6 +152,40 @@ pub struct WorkSiteScore {
     pub item: ParsedItem,
     pub score: f64,
     pub factors: ScoreFactors,
+    /// Recursive context window for richer search results
+    pub context: ContextEnvelope,
+}
+
+/// Recursive Context Window - enriched context for search results
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContextEnvelope {
+    /// Full module path breadcrumb (e.g., "crate::gravity::scoring")
+    pub breadcrumbs: String,
+    /// Other types/functions in the same file that share generics or are closely related
+    pub siblings: Vec<SiblingInfo>,
+    /// Expanded generic bounds without opening the file
+    pub generic_bounds: Vec<GenericBound>,
+    /// Parent item if this is nested (e.g., method inside impl block)
+    pub parent_context: Option<String>,
+}
+
+/// Information about a sibling item in the same file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiblingInfo {
+    pub name: String,
+    pub kind: String,
+    pub line: usize,
+    /// Shared generic parameters with the main item
+    pub shared_generics: Vec<String>,
+}
+
+/// A generic bound extracted from a type signature
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenericBound {
+    /// The generic parameter name (e.g., "T")
+    pub param: String,
+    /// The bound constraints (e.g., ["Serialize", "Clone"])
+    pub bounds: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -729,11 +729,312 @@ impl SemanticGravity {
             is_test,
         };
 
+        // Build the context envelope
+        let context = self.build_context_envelope(item);
+
         WorkSiteScore {
             item: item.clone(),
             score: score.max(0.0),
             factors,
+            context,
         }
+    }
+
+    /// Build a ContextEnvelope for an item (Recursive Context Window)
+    fn build_context_envelope(&self, item: &ParsedItem) -> ContextEnvelope {
+        let breadcrumbs = self.get_breadcrumbs(item);
+        let siblings = self.get_siblings(item);
+        let generic_bounds = self.extract_generic_bounds(item);
+        let parent_context = self.get_parent_context(item);
+
+        ContextEnvelope {
+            breadcrumbs,
+            siblings,
+            generic_bounds,
+            parent_context,
+        }
+    }
+
+    /// Get the full module path breadcrumb for an item
+    fn get_breadcrumbs(&self, item: &ParsedItem) -> String {
+        let module = self
+            .file_to_module
+            .get(&item.file_path)
+            .cloned()
+            .unwrap_or_else(|| "crate".to_string());
+
+        format!("{}::{}", module, item.name)
+    }
+
+    /// Find sibling items in the same file that share generics or are related
+    fn get_siblings(&self, item: &ParsedItem) -> Vec<SiblingInfo> {
+        let item_generics = self.extract_generic_params(item);
+
+        let Some(file) = self.files.iter().find(|f| f.path == item.file_path) else {
+            return Vec::new();
+        };
+
+        file.items
+            .iter()
+            .filter(|sibling| {
+                sibling.name != item.name
+                    && matches!(
+                        sibling.kind,
+                        ItemKind::Struct { .. }
+                            | ItemKind::Enum { .. }
+                            | ItemKind::Function { .. }
+                            | ItemKind::Trait { .. }
+                    )
+            })
+            .take(5) // Limit siblings to avoid noise
+            .map(|sibling| {
+                let sibling_generics = self.extract_generic_params(sibling);
+                let shared: Vec<String> = item_generics
+                    .iter()
+                    .filter(|g| sibling_generics.contains(g))
+                    .cloned()
+                    .collect();
+
+                SiblingInfo {
+                    name: sibling.name.clone(),
+                    kind: self.item_kind_name(&sibling.kind),
+                    line: sibling.span.start_line,
+                    shared_generics: shared,
+                }
+            })
+            .collect()
+    }
+
+    /// Get the kind name as a string
+    fn item_kind_name(&self, kind: &ItemKind) -> String {
+        match kind {
+            ItemKind::Function { .. } => "fn",
+            ItemKind::Struct { .. } => "struct",
+            ItemKind::Enum { .. } => "enum",
+            ItemKind::Trait { .. } => "trait",
+            ItemKind::Impl { .. } => "impl",
+            ItemKind::Mod { .. } => "mod",
+            ItemKind::Const { .. } => "const",
+            ItemKind::Static { .. } => "static",
+            ItemKind::TypeAlias { .. } => "type",
+            ItemKind::Macro { .. } => "macro",
+            ItemKind::Use { .. } => "use",
+            ItemKind::Unknown { .. } => "unknown",
+        }
+        .to_string()
+    }
+
+    /// Extract generic parameter names from an item
+    fn extract_generic_params(&self, item: &ParsedItem) -> Vec<String> {
+        let text = self.get_item_signature_text(item);
+        self.parse_generic_params(&text)
+    }
+
+    /// Get the signature text for generic extraction
+    fn get_item_signature_text(&self, item: &ParsedItem) -> String {
+        match &item.kind {
+            ItemKind::Function {
+                parameters,
+                return_type,
+                ..
+            } => {
+                let params: String = parameters.iter().map(|p| p.ty.as_str()).collect();
+                let ret = return_type.as_deref().unwrap_or("");
+                format!("{} {}", params, ret)
+            }
+            ItemKind::Struct { fields, .. } => fields.iter().map(|f| f.ty.as_str()).collect(),
+            ItemKind::Impl { self_type, .. } => self_type.clone(),
+            ItemKind::Trait { supertraits, .. } => supertraits.join(" + "),
+            _ => String::new(),
+        }
+    }
+
+    /// Parse generic parameter names from text (e.g., "T", "K", "V" from "<T, K: Hash, V>")
+    fn parse_generic_params(&self, text: &str) -> Vec<String> {
+        let mut params = Vec::new();
+        let mut depth: usize = 0;
+        let mut current = String::new();
+
+        for c in text.chars() {
+            match c {
+                '<' => {
+                    depth += 1;
+                    if depth == 1 {
+                        current.clear();
+                    }
+                }
+                '>' => {
+                    if depth == 1 && !current.trim().is_empty() {
+                        // Extract param name (before any colon)
+                        let param = current.split(':').next().unwrap_or("").trim();
+                        if !param.is_empty()
+                            && param.chars().next().is_some_and(|c| c.is_uppercase())
+                        {
+                            params.push(param.to_string());
+                        }
+                    }
+                    depth = depth.saturating_sub(1);
+                }
+                ',' if depth == 1 => {
+                    let param = current.split(':').next().unwrap_or("").trim();
+                    if !param.is_empty() && param.chars().next().is_some_and(|c| c.is_uppercase()) {
+                        params.push(param.to_string());
+                    }
+                    current.clear();
+                }
+                _ if depth >= 1 => {
+                    current.push(c);
+                }
+                _ => {}
+            }
+        }
+
+        params
+    }
+
+    /// Extract full generic bounds from item (the "Live Signature")
+    fn extract_generic_bounds(&self, item: &ParsedItem) -> Vec<GenericBound> {
+        // Read the source file to get the actual signature
+        let content = std::fs::read_to_string(&item.file_path).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Get lines around the item definition
+        let start = item.span.start_line.saturating_sub(1);
+        let end = (start + 5).min(lines.len()); // Look at first few lines of definition
+
+        let signature: String = lines[start..end].join(" ");
+
+        self.parse_generic_bounds(&signature)
+    }
+
+    /// Parse generic bounds from a signature string
+    fn parse_generic_bounds(&self, signature: &str) -> Vec<GenericBound> {
+        let mut bounds = Vec::new();
+
+        // Find the generic parameter section <...>
+        let Some(start) = signature.find('<') else {
+            return bounds;
+        };
+
+        let mut depth = 0;
+        let mut generic_section = String::new();
+
+        for c in signature[start..].chars() {
+            match c {
+                '<' => {
+                    depth += 1;
+                    if depth > 1 {
+                        generic_section.push(c);
+                    }
+                }
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    generic_section.push(c);
+                }
+                _ => {
+                    if depth >= 1 {
+                        generic_section.push(c);
+                    }
+                }
+            }
+        }
+
+        // Also check for where clauses
+        let where_clause = if let Some(where_pos) = signature.find("where") {
+            let end_pos = signature[where_pos..]
+                .find('{')
+                .unwrap_or(signature.len() - where_pos);
+            &signature[where_pos..where_pos + end_pos]
+        } else {
+            ""
+        };
+
+        // Parse each generic parameter
+        for part in generic_section.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+
+            // Split on first colon for param: bounds
+            let mut parts = part.splitn(2, ':');
+            let param = parts.next().unwrap_or("").trim().to_string();
+
+            if param.is_empty() || !param.chars().next().is_some_and(|c| c.is_uppercase()) {
+                continue;
+            }
+
+            let mut param_bounds: Vec<String> = Vec::new();
+
+            // Bounds from <T: Bound1 + Bound2>
+            if let Some(bound_str) = parts.next() {
+                for b in bound_str.split('+') {
+                    let b = b.trim();
+                    if !b.is_empty() {
+                        param_bounds.push(b.to_string());
+                    }
+                }
+            }
+
+            // Additional bounds from where clause
+            let where_pattern = format!("{}: ", param);
+            if let Some(pos) = where_clause.find(&where_pattern) {
+                let rest = &where_clause[pos + where_pattern.len()..];
+                let end = rest.find(',').unwrap_or(rest.len());
+                for b in rest[..end].split('+') {
+                    let b = b.trim();
+                    if !b.is_empty() && !param_bounds.contains(&b.to_string()) {
+                        param_bounds.push(b.to_string());
+                    }
+                }
+            }
+
+            if !param_bounds.is_empty() {
+                bounds.push(GenericBound {
+                    param,
+                    bounds: param_bounds,
+                });
+            } else {
+                // Include params without bounds too (for completeness)
+                bounds.push(GenericBound {
+                    param,
+                    bounds: vec![],
+                });
+            }
+        }
+
+        bounds
+    }
+
+    /// Get parent context (e.g., impl block for a method)
+    fn get_parent_context(&self, item: &ParsedItem) -> Option<String> {
+        // For now, if it's a method we'd look for the containing impl
+        // This requires positional analysis - check if there's an impl that contains this span
+        let Some(file) = self.files.iter().find(|f| f.path == item.file_path) else {
+            return None;
+        };
+
+        for other in &file.items {
+            if let ItemKind::Impl {
+                self_type,
+                trait_name,
+                methods,
+            } = &other.kind
+            {
+                if methods.contains(&item.name) {
+                    return Some(if let Some(trait_n) = trait_name {
+                        format!("impl {} for {}", trait_n, self_type)
+                    } else {
+                        format!("impl {}", self_type)
+                    });
+                }
+            }
+        }
+
+        None
     }
 
     /// Get impl information for a type
