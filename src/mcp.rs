@@ -62,6 +62,10 @@ impl ServerHandler for CargomapServerHandler {
             CargomapTools::AuditImpact(tool) => {
                 tool.call_tool_async(&self.project_root, runtime).await
             }
+            // Introspect requires async + runtime for dialectical LLM loop
+            CargomapTools::Introspect(tool) => {
+                tool.call_tool_async(&self.project_root, runtime).await
+            }
         }
     }
 }
@@ -1328,6 +1332,669 @@ impl DiagnoseTraitBound {
     }
 }
 
+// ==================== Introspect (Strange Loop) ====================
+
+/// Introspect a symbol to discover its "soul" through dialectical reasoning
+#[mcp_tool(
+    name = "introspect",
+    description = "Discovers the essential nature ('soul') of a struct or function through dialectical reasoning. Uses iterative LLM sampling to generate a thesis about what the symbol IS, then probes the AST for contradictions, forcing re-evaluation until convergence. Returns a 'realization' - a stable, grounded understanding of the symbol's role.",
+    read_only_hint = true
+)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct Introspect {
+    /// The name of the struct or function to introspect
+    symbol: String,
+    /// Maximum iterations before forcing convergence (default: 5)
+    #[serde(default = "default_max_loops")]
+    max_loops: Option<u8>,
+    /// Similarity threshold for convergence (0.0-1.0, default: 0.85)
+    #[serde(default = "default_convergence_threshold")]
+    convergence_threshold: Option<f32>,
+}
+
+fn default_max_loops() -> Option<u8> {
+    Some(5)
+}
+
+fn default_convergence_threshold() -> Option<f32> {
+    Some(0.85)
+}
+
+/// A contradiction found between the thesis and the code
+#[derive(Debug)]
+struct Contradiction {
+    /// What the thesis claimed
+    claim: String,
+    /// What the code actually shows
+    evidence: String,
+    /// Location in codebase
+    location: String,
+}
+
+/// Patterns to probe for in the AST based on thesis claims
+#[derive(Debug, Clone)]
+enum AstProbe {
+    /// Check if struct has mutable state (fields that suggest state)
+    HasMutableState,
+    /// Check if struct has stateful fields (HashMap, Vec, etc.)
+    HasStatefulFields,
+    /// Check if any method mutates self
+    HasMutatingMethods,
+    /// Check if there are side effects (calls to external systems)
+    HasSideEffects,
+    /// Check for static/global state
+    HasStaticState,
+    /// Check for async operations
+    HasAsyncOps,
+    /// Check for error handling patterns
+    HasErrorHandling,
+    /// Custom pattern to search for
+    Custom(String),
+}
+
+impl Introspect {
+    pub async fn call_tool_async(
+        &self,
+        project_root: &PathBuf,
+        runtime: Arc<dyn McpServer>,
+    ) -> Result<CallToolResult, CallToolError> {
+        // Check if client supports sampling
+        let supports_sampling = runtime.client_supports_sampling().unwrap_or(false);
+        if !supports_sampling {
+            return Ok(CallToolResult::text_content(vec![TextContent::from(
+                "Error: The connected client does not support LLM sampling. \
+                 The introspect tool requires sampling capabilities for dialectical reasoning."
+                    .to_string(),
+            )]));
+        }
+
+        // Analyze the project
+        let mut gravity = SemanticGravity::new();
+        gravity
+            .analyze_project(project_root)
+            .map_err(|e| CallToolError::from_message(e.to_string()))?;
+
+        // Find the target symbol
+        let results = gravity.search(&self.symbol);
+        if results.is_empty() {
+            return Ok(CallToolResult::text_content(vec![TextContent::from(
+                format!("No symbol named '{}' found in the project.", self.symbol),
+            )]));
+        }
+
+        let target = &results[0];
+        let max_loops = self.max_loops.unwrap_or(5) as usize;
+        let threshold = self.convergence_threshold.unwrap_or(0.85);
+
+        // Gather context about the symbol
+        let symbol_context = self.gather_symbol_context(&gravity, target);
+
+        // The Strange Loop begins
+        let mut loop_trace = Vec::new();
+        let mut current_thesis = String::new();
+        let mut previous_thesis = String::new();
+        let mut iteration = 0;
+
+        // Initial thesis generation
+        current_thesis = self
+            .generate_initial_thesis(&symbol_context, &runtime)
+            .await?;
+        loop_trace.push(format!(
+            "## Iteration 0: Initial Thesis\n{}",
+            current_thesis
+        ));
+
+        for i in 0..max_loops {
+            iteration = i + 1;
+
+            // Generate falsifiable predicates from the thesis
+            let probes = self.generate_probes(&current_thesis, &runtime).await?;
+
+            // Probe the AST for contradictions
+            let contradictions = self.find_contradictions(&probes, &gravity, target);
+
+            if contradictions.is_empty() {
+                // No contradictions found - thesis is consistent with code
+                loop_trace.push(format!(
+                    "## Iteration {}: No Contradictions\nThesis is consistent with codebase.",
+                    iteration
+                ));
+                break;
+            }
+
+            // Format contradictions for the LLM
+            let contradiction_text: String = contradictions
+                .iter()
+                .map(|c| {
+                    format!(
+                        "- **Claim:** {}\n  **Evidence:** {}\n  **Location:** {}",
+                        c.claim, c.evidence, c.location
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
+            loop_trace.push(format!(
+                "## Iteration {}: Contradictions Found\n{}",
+                iteration, contradiction_text
+            ));
+
+            // Store previous thesis for convergence check
+            previous_thesis = current_thesis.clone();
+
+            // Synthesize new thesis with temperature decay
+            let temperature = 0.7 - (i as f32 * 0.12); // Decay towards determinism
+            current_thesis = self
+                .synthesize_thesis(
+                    &current_thesis,
+                    &contradiction_text,
+                    &symbol_context,
+                    temperature,
+                    &runtime,
+                )
+                .await?;
+
+            loop_trace.push(format!(
+                "## Iteration {}: Revised Thesis (temp={:.2})\n{}",
+                iteration, temperature, current_thesis
+            ));
+
+            // Check for convergence using embedding similarity
+            if !previous_thesis.is_empty() {
+                match crate::embedding::has_converged(&current_thesis, &previous_thesis, threshold)
+                {
+                    Ok(true) => {
+                        loop_trace.push(format!(
+                            "## Convergence Reached\nSemantic similarity exceeded {} threshold.",
+                            threshold
+                        ));
+                        break;
+                    }
+                    Ok(false) => {
+                        // Check for divergence (thesis growing without substance)
+                        if current_thesis.len() > previous_thesis.len() * 2 {
+                            loop_trace.push(
+                                "## Divergence Detected\nThesis growing without adding substance. Forcing simplification."
+                                    .to_string(),
+                            );
+                            // Force a simplification in next iteration by including this in context
+                        }
+                    }
+                    Err(e) => {
+                        // Embedding failed, fall back to simple length check
+                        loop_trace.push(format!(
+                            "## Convergence Check Failed\nEmbedding error: {}. Using fallback.",
+                            e
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Build the final realization
+        let mut output = format!("# Introspection: `{}`\n\n", self.symbol);
+        output.push_str(&format!(
+            "**Symbol:** {} at {}:{}\n",
+            target.item.name,
+            target.item.file_path.display(),
+            target.item.span.start_line
+        ));
+        output.push_str(&format!("**Iterations:** {} / {}\n", iteration, max_loops));
+        output.push_str(&format!("**Convergence Threshold:** {}\n\n", threshold));
+
+        output.push_str("---\n\n");
+        output.push_str("## The Realization\n\n");
+        output.push_str(&current_thesis);
+        output.push_str("\n\n---\n\n");
+
+        output.push_str("## Dialectical Trace\n\n");
+        output.push_str(&loop_trace.join("\n\n---\n\n"));
+
+        Ok(CallToolResult::text_content(vec![TextContent::from(
+            output,
+        )]))
+    }
+
+    /// Gather comprehensive context about a symbol
+    fn gather_symbol_context(
+        &self,
+        gravity: &SemanticGravity,
+        target: &crate::types::WorkSiteScore,
+    ) -> String {
+        let mut context = String::new();
+
+        // Basic info
+        context.push_str(&format!("**Name:** {}\n", target.item.name));
+        context.push_str(&format!("**Path:** {}\n", target.context.breadcrumbs));
+        context.push_str(&format!(
+            "**File:** {}:{}\n",
+            target.item.file_path.display(),
+            target.item.span.start_line
+        ));
+
+        // Kind-specific info
+        match &target.item.kind {
+            crate::types::ItemKind::Struct { fields, .. } => {
+                context.push_str("\n**Fields:**\n");
+                for field in fields {
+                    context.push_str(&format!(
+                        "  - {}: {}\n",
+                        field.name.as_deref().unwrap_or("_"),
+                        field.ty
+                    ));
+                }
+            }
+            crate::types::ItemKind::Function {
+                parameters,
+                return_type,
+                is_async,
+            } => {
+                if *is_async {
+                    context.push_str("**Async:** yes\n");
+                }
+                context.push_str("\n**Parameters:**\n");
+                for param in parameters {
+                    context.push_str(&format!("  - {}: {}\n", param.name, param.ty));
+                }
+                if let Some(ret) = return_type {
+                    context.push_str(&format!("**Returns:** {}\n", ret));
+                }
+            }
+            crate::types::ItemKind::Enum { variants } => {
+                context.push_str("\n**Variants:**\n");
+                for variant in variants {
+                    context.push_str(&format!("  - {}\n", variant.name));
+                }
+            }
+            _ => {}
+        }
+
+        // Doc comment if available
+        if let Some(doc) = &target.item.doc_comment {
+            context.push_str(&format!("\n**Documentation:**\n{}\n", doc));
+        }
+
+        // Find call sites
+        let call_sites = gravity.find_call_sites(&self.symbol);
+        if !call_sites.is_empty() {
+            context.push_str(&format!("\n**Call Sites:** {} found\n", call_sites.len()));
+            for site in call_sites.iter().take(5) {
+                context.push_str(&format!(
+                    "  - {}() at {}:{}\n",
+                    site.caller,
+                    site.file.display(),
+                    site.line
+                ));
+            }
+        }
+
+        // Read the actual source code
+        if let Ok(source) = std::fs::read_to_string(&target.item.file_path) {
+            let lines: Vec<&str> = source.lines().collect();
+            let start = target.item.span.start_line.saturating_sub(1);
+            let end = (target.item.span.end_line).min(lines.len());
+            if start < end {
+                context.push_str("\n**Source Code:**\n```rust\n");
+                for line in &lines[start..end] {
+                    context.push_str(line);
+                    context.push('\n');
+                }
+                context.push_str("```\n");
+            }
+        }
+
+        context
+    }
+
+    /// Generate the initial thesis about what the symbol IS
+    async fn generate_initial_thesis(
+        &self,
+        context: &str,
+        runtime: &Arc<dyn McpServer>,
+    ) -> Result<String, CallToolError> {
+        let prompt = format!(
+            r#"You are analyzing a Rust symbol to understand its essential nature - its "soul".
+
+## Symbol Context
+{context}
+
+## Your Task
+Describe what this symbol IS at its core. Not what it does mechanically, but its essential PURPOSE and NATURE in the system.
+
+Consider:
+1. What role does it play in the architecture?
+2. What invariants does it maintain?
+3. What would break if this symbol didn't exist?
+4. Is it stateful or stateless? A coordinator or a worker?
+
+Be concise but precise. Use 2-4 sentences maximum."#
+        );
+
+        self.sample_llm(&prompt, 0.7, 500, runtime).await
+    }
+
+    /// Generate AST probes based on the thesis
+    async fn generate_probes(
+        &self,
+        thesis: &str,
+        runtime: &Arc<dyn McpServer>,
+    ) -> Result<Vec<AstProbe>, CallToolError> {
+        let prompt = format!(
+            r#"Given this thesis about a Rust symbol:
+
+"{thesis}"
+
+What falsifiable claims does this thesis make? For each claim, specify what code pattern would CONTRADICT it.
+
+Respond with a JSON array of probe types. Valid types:
+- "HasMutableState" - contradicts claims of immutability/statelessness
+- "HasStatefulFields" - contradicts claims of being a pure function/stateless
+- "HasMutatingMethods" - contradicts claims of not modifying state
+- "HasSideEffects" - contradicts claims of being pure/side-effect-free
+- "HasStaticState" - contradicts claims of no global state
+- "HasAsyncOps" - contradicts claims of synchronous operation
+- "HasErrorHandling" - contradicts claims of infallibility
+- {{"Custom": "pattern"}} - search for specific pattern in source
+
+Example response:
+["HasMutableState", "HasStatefulFields", {{"Custom": "unsafe"}}]
+
+Return ONLY the JSON array, no explanation."#
+        );
+
+        let response = self.sample_llm(&prompt, 0.3, 200, runtime).await?;
+
+        // Parse the JSON response
+        let probes = self.parse_probes(&response);
+        Ok(probes)
+    }
+
+    /// Parse probe response from LLM
+    fn parse_probes(&self, response: &str) -> Vec<AstProbe> {
+        // Try to extract JSON array from response
+        let json_start = response.find('[');
+        let json_end = response.rfind(']');
+
+        if let (Some(start), Some(end)) = (json_start, json_end) {
+            let json_str = &response[start..=end];
+            if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
+                return parsed
+                    .iter()
+                    .filter_map(|v| match v {
+                        serde_json::Value::String(s) => match s.as_str() {
+                            "HasMutableState" => Some(AstProbe::HasMutableState),
+                            "HasStatefulFields" => Some(AstProbe::HasStatefulFields),
+                            "HasMutatingMethods" => Some(AstProbe::HasMutatingMethods),
+                            "HasSideEffects" => Some(AstProbe::HasSideEffects),
+                            "HasStaticState" => Some(AstProbe::HasStaticState),
+                            "HasAsyncOps" => Some(AstProbe::HasAsyncOps),
+                            "HasErrorHandling" => Some(AstProbe::HasErrorHandling),
+                            _ => None,
+                        },
+                        serde_json::Value::Object(obj) => obj
+                            .get("Custom")
+                            .and_then(|v| v.as_str())
+                            .map(|s| AstProbe::Custom(s.to_string())),
+                        _ => None,
+                    })
+                    .collect();
+            }
+        }
+
+        // Default probes if parsing fails
+        vec![
+            AstProbe::HasMutableState,
+            AstProbe::HasStatefulFields,
+            AstProbe::HasMutatingMethods,
+        ]
+    }
+
+    /// Find contradictions between probes and actual code
+    fn find_contradictions(
+        &self,
+        probes: &[AstProbe],
+        gravity: &SemanticGravity,
+        target: &crate::types::WorkSiteScore,
+    ) -> Vec<Contradiction> {
+        let mut contradictions = Vec::new();
+
+        // Read source code for pattern matching
+        let source = std::fs::read_to_string(&target.item.file_path).unwrap_or_default();
+
+        for probe in probes {
+            match probe {
+                AstProbe::HasMutableState => {
+                    // Check for &mut self methods or mutable fields
+                    if source.contains("&mut self") {
+                        contradictions.push(Contradiction {
+                            claim: "stateless/immutable".to_string(),
+                            evidence: "Found `&mut self` method - this type mutates its own state"
+                                .to_string(),
+                            location: target.item.file_path.display().to_string(),
+                        });
+                    }
+                }
+                AstProbe::HasStatefulFields => {
+                    // Check struct fields for stateful types
+                    if let crate::types::ItemKind::Struct { fields, .. } = &target.item.kind {
+                        for field in fields {
+                            let ty = &field.ty;
+                            if ty.contains("HashMap")
+                                || ty.contains("Vec")
+                                || ty.contains("BTreeMap")
+                                || ty.contains("HashSet")
+                            {
+                                contradictions.push(Contradiction {
+                                    claim: "stateless".to_string(),
+                                    evidence: format!(
+                                        "Field `{}` has type `{}` - a stateful collection",
+                                        field.name.as_deref().unwrap_or("_"),
+                                        ty
+                                    ),
+                                    location: format!(
+                                        "{}:{}",
+                                        target.item.file_path.display(),
+                                        target.item.span.start_line
+                                    ),
+                                });
+                            }
+                            if ty.contains("Mutex") || ty.contains("RwLock") || ty.contains("Cell")
+                            {
+                                contradictions.push(Contradiction {
+                                    claim: "simple state".to_string(),
+                                    evidence: format!(
+                                        "Field `{}` uses interior mutability (`{}`)",
+                                        field.name.as_deref().unwrap_or("_"),
+                                        ty
+                                    ),
+                                    location: format!(
+                                        "{}:{}",
+                                        target.item.file_path.display(),
+                                        target.item.span.start_line
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                AstProbe::HasMutatingMethods => {
+                    // Search for methods that modify state
+                    let related_items = gravity.search(&self.symbol);
+                    for item in &related_items {
+                        if let crate::types::ItemKind::Function { parameters, .. } = &item.item.kind
+                        {
+                            for param in parameters {
+                                if param.name == "self" && param.ty.contains("&mut") {
+                                    contradictions.push(Contradiction {
+                                        claim: "non-mutating".to_string(),
+                                        evidence: format!(
+                                            "Method `{}` takes `&mut self`",
+                                            item.item.name
+                                        ),
+                                        location: format!(
+                                            "{}:{}",
+                                            item.item.file_path.display(),
+                                            item.item.span.start_line
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                AstProbe::HasSideEffects => {
+                    // Check for side-effect patterns
+                    let patterns = [
+                        ("std::fs::", "filesystem operations"),
+                        ("std::io::", "I/O operations"),
+                        ("std::net::", "network operations"),
+                        ("println!", "console output"),
+                        ("eprintln!", "error output"),
+                        ("log::", "logging"),
+                        ("tracing::", "tracing"),
+                    ];
+                    for (pattern, description) in patterns {
+                        if source.contains(pattern) {
+                            contradictions.push(Contradiction {
+                                claim: "pure/no side effects".to_string(),
+                                evidence: format!("Found {} ({})", pattern, description),
+                                location: target.item.file_path.display().to_string(),
+                            });
+                            break; // One is enough
+                        }
+                    }
+                }
+                AstProbe::HasStaticState => {
+                    // Check for static/global state
+                    if source.contains("static mut")
+                        || source.contains("lazy_static")
+                        || source.contains("OnceLock")
+                    {
+                        contradictions.push(Contradiction {
+                            claim: "no global state".to_string(),
+                            evidence: "Found static/global state pattern".to_string(),
+                            location: target.item.file_path.display().to_string(),
+                        });
+                    }
+                }
+                AstProbe::HasAsyncOps => {
+                    // Check for async patterns
+                    if source.contains("async fn") || source.contains(".await") {
+                        contradictions.push(Contradiction {
+                            claim: "synchronous".to_string(),
+                            evidence: "Found async operations".to_string(),
+                            location: target.item.file_path.display().to_string(),
+                        });
+                    }
+                }
+                AstProbe::HasErrorHandling => {
+                    // Check for Result/Option patterns suggesting fallibility
+                    if source.contains("-> Result<") || source.contains("?;") {
+                        contradictions.push(Contradiction {
+                            claim: "infallible".to_string(),
+                            evidence: "Returns Result type - operation can fail".to_string(),
+                            location: target.item.file_path.display().to_string(),
+                        });
+                    }
+                }
+                AstProbe::Custom(pattern) => {
+                    if source.contains(pattern.as_str()) {
+                        contradictions.push(Contradiction {
+                            claim: format!("does not use '{}'", pattern),
+                            evidence: format!("Found '{}' in source", pattern),
+                            location: target.item.file_path.display().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        contradictions
+    }
+
+    /// Synthesize a new thesis incorporating contradictions
+    async fn synthesize_thesis(
+        &self,
+        current_thesis: &str,
+        contradictions: &str,
+        context: &str,
+        temperature: f32,
+        runtime: &Arc<dyn McpServer>,
+    ) -> Result<String, CallToolError> {
+        let prompt = format!(
+            r#"You are refining your understanding of a Rust symbol through dialectical reasoning.
+
+## Your Previous Thesis
+{current_thesis}
+
+## Contradictions Found
+{contradictions}
+
+## Symbol Context (for reference)
+{context}
+
+## Your Task
+Synthesize a NEW thesis that reconciles your previous understanding with the evidence.
+- If the evidence invalidates your claim, revise it
+- If the evidence reveals nuance, incorporate it
+- If the evidence is about a special case, note the exception
+
+Be precise and concise. 2-4 sentences. Do not simply repeat the previous thesis with minor changes."#
+        );
+
+        self.sample_llm(&prompt, temperature, 500, runtime).await
+    }
+
+    /// Sample the LLM with given parameters
+    async fn sample_llm(
+        &self,
+        prompt: &str,
+        temperature: f32,
+        max_tokens: i64,
+        runtime: &Arc<dyn McpServer>,
+    ) -> Result<String, CallToolError> {
+        let sampling_params = CreateMessageRequestParams {
+            messages: vec![SamplingMessage {
+                role: Role::User,
+                content: SamplingMessageContent::TextContent(TextContent::from(prompt.to_string())),
+                meta: None,
+            }],
+            model_preferences: Some(ModelPreferences {
+                hints: vec![],
+                cost_priority: Some(0.3),
+                speed_priority: Some(0.4),
+                intelligence_priority: Some(0.8),
+            }),
+            system_prompt: Some(
+                "You are an expert Rust developer performing deep code analysis. \
+                 Be precise, concise, and insightful."
+                    .to_string(),
+            ),
+            max_tokens,
+            include_context: None,
+            meta: None,
+            metadata: None,
+            stop_sequences: vec![],
+            task: None,
+            temperature: Some(temperature as f64),
+            tool_choice: None,
+            tools: vec![],
+        };
+
+        let result = runtime
+            .request_message_creation(sampling_params)
+            .await
+            .map_err(|e| CallToolError::from_message(format!("Sampling failed: {}", e)))?;
+
+        match &result.content {
+            CreateMessageContent::TextContent(text) => Ok(text.text.clone()),
+            _ => Err(CallToolError::from_message(
+                "Unexpected response type".to_string(),
+            )),
+        }
+    }
+}
+
 // Generate the tool_box enum
 tool_box!(
     CargomapTools,
@@ -1338,7 +2005,8 @@ tool_box!(
         FindCallers,
         GetExternalUsages,
         AuditImpact,
-        DiagnoseTraitBound
+        DiagnoseTraitBound,
+        Introspect
     ]
 );
 

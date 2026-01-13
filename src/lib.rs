@@ -8,6 +8,7 @@
 //! - MCP server for LLM tool integration
 
 pub mod dependency;
+pub mod embedding;
 pub mod gravity;
 pub mod mcp;
 pub mod parser;

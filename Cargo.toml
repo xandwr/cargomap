@@ -1,6 +1,6 @@
 [package]
 name = "cargomap"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 publish = true
 license = "MIT"
@@ -24,3 +24,5 @@ clap = { version = "4.5.54", features = ["derive"] }
 rust-mcp-sdk = { version = "0.8.1", default-features = false, features = ["server", "macros", "stdio"] }
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
+ort = "2.0.0-rc.11"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
