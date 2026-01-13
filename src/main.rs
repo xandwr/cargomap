@@ -69,6 +69,14 @@ enum Commands {
 
     /// Start MCP server over stdio for LLM tool integration
     Serve,
+
+    /// Diagnose why a trait isn't implemented for a struct
+    Diagnose {
+        /// Name of the struct to analyze
+        struct_name: String,
+        /// Name of the trait (e.g., Send, Serialize, Clone)
+        trait_name: String,
+    },
 }
 
 fn main() {
@@ -126,6 +134,12 @@ fn main() {
         }
         Some(Commands::Deps { limit }) => {
             cmd_deps(&mut dep_bridge, limit);
+        }
+        Some(Commands::Diagnose {
+            struct_name,
+            trait_name,
+        }) => {
+            cmd_diagnose(&gravity, &struct_name, &trait_name);
         }
         Some(Commands::Serve) => unreachable!(), // Handled above
         None => {
@@ -421,5 +435,230 @@ impl AnalysisSession {
     /// Get the project summary
     fn summary(&self) -> cargomap::gravity::ProjectSummary {
         self.gravity.summarize()
+    }
+}
+
+fn cmd_diagnose(gravity: &SemanticGravity, struct_name: &str, trait_name: &str) {
+    use cargomap::types::ItemKind;
+
+    println!(
+        "=== Trait Bound Diagnosis: `{}` for `{}` ===\n",
+        trait_name, struct_name
+    );
+
+    let results = gravity.search(struct_name);
+    let struct_result = results
+        .iter()
+        .find(|r| matches!(r.item.kind, ItemKind::Struct { .. }) && r.item.name == struct_name);
+
+    let Some(result) = struct_result else {
+        println!("No struct named '{}' found in the project.\n", struct_name);
+        let struct_results: Vec<_> = results
+            .iter()
+            .filter(|r| matches!(r.item.kind, ItemKind::Struct { .. }))
+            .take(5)
+            .collect();
+        if !struct_results.is_empty() {
+            println!("Did you mean one of these?");
+            for r in struct_results {
+                println!("  - {}", r.item.name);
+            }
+        }
+        return;
+    };
+
+    println!(
+        "File: {}:{}\n",
+        result.item.file_path.display(),
+        result.item.span.start_line
+    );
+
+    let ItemKind::Struct { fields, .. } = &result.item.kind else {
+        println!("'{}' is not a struct.", struct_name);
+        return;
+    };
+
+    // Analyze fields using the trait_blockers module logic
+    let trait_lower = trait_name.to_lowercase();
+    let blockers = get_blockers_for_trait(&trait_lower);
+
+    let mut found_blockers = Vec::new();
+
+    for field in fields {
+        let field_name = field.name.as_deref().unwrap_or("_unnamed");
+        let field_type = &field.ty;
+        // Normalize the type for comparison (remove spaces around angle brackets)
+        let normalized_type = field_type.replace(" < ", "<").replace(" > ", ">");
+
+        for blocker in &blockers {
+            if normalized_type.contains(blocker) {
+                found_blockers.push((field_name.to_string(), field_type.clone(), *blocker));
+                break;
+            }
+        }
+    }
+
+    if found_blockers.is_empty() {
+        println!("✅ No obvious blockers found for `{}`.\n", trait_name);
+        println!("The struct's fields appear compatible with this trait.");
+        println!("If you're still seeing errors, check:");
+        println!("  1. Generic type parameters may need bounds");
+        println!("  2. Nested types within collections may be the issue");
+        println!("  3. The trait may need to be in scope (`use` statement)");
+        println!("  4. For derive macros, ensure the trait's derive macro is available\n");
+
+        println!("Struct fields:");
+        for field in fields {
+            let name = field.name.as_deref().unwrap_or("_");
+            println!("  - {}: {}", name, field.ty);
+        }
+    } else {
+        println!("❌ Found {} blocking field(s):\n", found_blockers.len());
+
+        for (i, (field_name, field_type, blocker)) in found_blockers.iter().enumerate() {
+            println!("{}. Field `{}`", i + 1, field_name);
+            println!("   Type: `{}`", field_type);
+            println!("   Blocker: `{}` prevents `{}`", blocker, trait_name);
+            println!(
+                "   Suggestion: {}\n",
+                get_suggestion(&trait_lower, field_name, field_type)
+            );
+        }
+
+        println!(
+            "---\nPrimary blocker: Field `{}` (type: `{}`) is the main reason `{}` fails.",
+            found_blockers[0].0, found_blockers[0].1, trait_name
+        );
+    }
+}
+
+fn get_blockers_for_trait(trait_name: &str) -> Vec<&'static str> {
+    match trait_name {
+        "send" => vec![
+            "Rc<",
+            "RefCell",
+            "Cell<",
+            "*const",
+            "*mut",
+            "MutexGuard",
+            "RwLockReadGuard",
+            "RwLockWriteGuard",
+            "Ref<",
+            "RefMut<",
+            "LocalKey",
+        ],
+        "sync" => vec!["Rc<", "RefCell", "Cell<", "UnsafeCell", "*const", "*mut"],
+        "clone" => vec![
+            "MutexGuard",
+            "RwLockReadGuard",
+            "RwLockWriteGuard",
+            "File",
+            "TcpStream",
+            "TcpListener",
+            "UdpSocket",
+            "JoinHandle",
+            "Receiver",
+            "Sender",
+        ],
+        "serialize" | "deserialize" => vec![
+            "SystemTime",
+            "Instant",
+            "Mutex<",
+            "RwLock<",
+            "Box<dyn",
+            "&dyn",
+            "fn(",
+            "impl ",
+            "MutexGuard",
+            "JoinHandle",
+            "Receiver",
+            "Sender",
+        ],
+        "copy" => vec![
+            "String", "Vec<", "Box<", "Rc<", "Arc<", "HashMap", "HashSet", "PathBuf", "Mutex",
+            "RwLock",
+        ],
+        "default" => vec!["File", "TcpStream", "TcpListener", "UdpSocket", "NonZero"],
+        "hash" => vec!["f32", "f64", "HashMap", "HashSet"],
+        "ord" => vec!["f32", "f64", "HashMap", "HashSet"],
+        _ => vec![],
+    }
+}
+
+fn get_suggestion(trait_name: &str, _field_name: &str, field_type: &str) -> String {
+    // Normalize for matching
+    let normalized = field_type.replace(" < ", "<").replace(" > ", ">");
+    match trait_name {
+        "send" => {
+            if normalized.contains("Rc<") {
+                format!("Replace `Rc<T>` with `Arc<T>` for thread-safe reference counting")
+            } else if normalized.contains("RefCell") {
+                format!("Replace `RefCell<T>` with `Mutex<T>` or `RwLock<T>` for thread safety")
+            } else if normalized.contains("Cell<") {
+                format!("Use `AtomicXxx` types or `Mutex<T>` instead of `Cell<T>`")
+            } else if normalized.contains("*const") || normalized.contains("*mut") {
+                format!("Wrap raw pointer in a `Send` newtype with `unsafe impl Send`")
+            } else {
+                format!("Check if there's a thread-safe alternative")
+            }
+        }
+        "sync" => {
+            if normalized.contains("Rc<") {
+                format!("Replace `Rc<T>` with `Arc<T>` for Sync")
+            } else if normalized.contains("RefCell") || normalized.contains("Cell<") {
+                format!(
+                    "Use `Mutex<T>`, `RwLock<T>`, or atomic types for thread-safe interior mutability"
+                )
+            } else if normalized.contains("UnsafeCell") {
+                format!(
+                    "`UnsafeCell` is the primitive for interior mutability; wrap in synchronized type"
+                )
+            } else if normalized.contains("*const") || normalized.contains("*mut") {
+                format!(
+                    "Raw pointers are not Sync; wrap in synchronized newtype with `unsafe impl Sync`"
+                )
+            } else {
+                format!("Check if there's a thread-safe alternative")
+            }
+        }
+        "serialize" | "deserialize" => {
+            if normalized.contains("SystemTime") {
+                format!(
+                    "Use `#[serde(with = \"humantime_serde\")]` or switch to `chrono::DateTime`"
+                )
+            } else if normalized.contains("Instant") {
+                format!("Store as Duration or Unix timestamp instead (Instant is process-relative)")
+            } else if normalized.contains("Arc<") || normalized.contains("Rc<") {
+                format!("Enable serde's `rc` feature: `serde = {{ features = [\"rc\"] }}`")
+            } else if normalized.contains("Mutex<") || normalized.contains("RwLock<") {
+                format!("Use `#[serde(skip)]` or extract the inner value for serialization")
+            } else if normalized.contains("dyn ") {
+                format!("Use `#[serde(skip)]` or implement with `typetag` crate")
+            } else {
+                format!("Add `#[serde(skip)]` or implement Serialize for the type")
+            }
+        }
+        "clone" => {
+            if normalized.contains("File") || normalized.contains("TcpStream") {
+                format!("Use `try_clone()` method or wrap in `Arc<Mutex<...>>`")
+            } else if normalized.contains("Guard") {
+                format!("Don't store lock guards in structs; restructure the code")
+            } else if normalized.contains("JoinHandle") {
+                format!("JoinHandles represent unique ownership; use channels instead")
+            } else {
+                format!("Derive Clone for the inner type or use `Arc<T>`")
+            }
+        }
+        "copy" => {
+            if normalized.contains("String")
+                || normalized.contains("Vec<")
+                || normalized.contains("Box<")
+            {
+                format!("Heap-allocated types can't be Copy; use Clone instead")
+            } else {
+                format!("All fields must be Copy; consider using Clone")
+            }
+        }
+        _ => format!("Ensure the field type implements `{}`", trait_name),
     }
 }
